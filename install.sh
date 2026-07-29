@@ -531,16 +531,31 @@ configure_firewall() {
 }
 
 create_systemd_service() {
-    log "Создание сервиса..."
+    log "Создание сервиса и скрипта авто-привязки IP..."
+
+    cat > "/home/3proxy/bind_ips.sh" << 'EOF'
+#!/bin/bash
+CONFIG_FILE="/home/3proxy/3proxy.cfg"
+IFACE=$(ip route | grep default | head -1 | awk '{print $5}' 2>/dev/null)
+[[ -z "$IFACE" ]] && IFACE=$(ip link show | grep -E "^[0-9]+: (eth|ens|enp|venet)" | head -1 | cut -d: -f2 | tr -d ' ')
+
+if [[ -f "$CONFIG_FILE" && -n "$IFACE" ]]; then
+    awk -F"-e" '{print $2}' "$CONFIG_FILE" | awk '{print $1}' | grep ":" | while read -r ip; do
+        ip -6 addr add "$ip/64" dev "$IFACE" 2>/dev/null || true
+    done
+fi
+EOF
+    chmod +x /home/3proxy/bind_ips.sh
 
     cat > "$SERVICE_FILE" << 'EOF'
 [Unit]
 Description=3proxy прокси сервер
-After=network.target
-Wants=network.target
+After=network.target network-online.target
+Wants=network.target network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/bash /home/3proxy/bind_ips.sh
 ExecStart=/home/3proxy/3proxy /home/3proxy/3proxy.cfg
 WorkingDirectory=/home/3proxy
 Restart=always
@@ -553,6 +568,11 @@ LimitNPROC=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    cat > /etc/cron.d/3proxy_bind << 'EOF'
+*/5 * * * * root /bin/bash /home/3proxy/bind_ips.sh >/dev/null 2>&1
+EOF
+    chmod 644 /etc/cron.d/3proxy_bind
 
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable 3proxy >/dev/null 2>&1
