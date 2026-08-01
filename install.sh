@@ -544,6 +544,7 @@ if [[ -f "$CONFIG_FILE" && -n "$IFACE" ]]; then
         ip -6 addr add "$ip/64" dev "$IFACE" 2>/dev/null || true
     done
 fi
+exit 0
 EOF
     chmod +x /home/3proxy/bind_ips.sh
 
@@ -555,7 +556,7 @@ Wants=network.target network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/bash /home/3proxy/bind_ips.sh
+ExecStartPre=-/bin/bash /home/3proxy/bind_ips.sh
 ExecStart=/home/3proxy/3proxy /home/3proxy/3proxy.cfg
 WorkingDirectory=/home/3proxy
 Restart=always
