@@ -132,6 +132,41 @@ check_port_range() {
 get_user_input() {
     log "Начинаем настройку..."
 
+    echo ""
+    log "Выберите целевую операционную систему (сетевой отпечаток TCP/IP & TTL):"
+    echo -e "  ${YELLOW}1)${NC} Windows          (TTL / Hop Limit = 128) [Рекомендуется для профилей Windows]"
+    echo -e "  ${YELLOW}2)${NC} macOS            (TTL / Hop Limit = 64, стек Darwin) [Для профилей Mac / Safari]"
+    echo -e "  ${YELLOW}3)${NC} Linux / Android  (TTL / Hop Limit = 64, нативный стек Linux) [Для моб. ферм / Linux]"
+    while true; do
+        read -p "Ваш выбор [1-3] (по умолчанию 1): " OS_OPT
+        OS_OPT=${OS_OPT:-1}
+        case "$OS_OPT" in
+            1)
+                TARGET_OS_NAME="Windows"
+                TARGET_TTL=128
+                TARGET_TCP_TS=0
+                break
+                ;;
+            2)
+                TARGET_OS_NAME="macOS"
+                TARGET_TTL=64
+                TARGET_TCP_TS=1
+                break
+                ;;
+            3)
+                TARGET_OS_NAME="Linux / Android"
+                TARGET_TTL=64
+                TARGET_TCP_TS=1
+                break
+                ;;
+            *)
+                error "Пожалуйста, введите 1, 2 или 3"
+                ;;
+        esac
+    done
+    log "Выбран сетевой отпечаток: ${GREEN}$TARGET_OS_NAME${NC} (TTL/Hop Limit = $TARGET_TTL)"
+    echo ""
+
     while true; do
         echo -n "IPv6 подсеть (например, 2001:db8::/64): "
         read IPV6_SUBNET
@@ -289,7 +324,7 @@ EOF
         echo "DefaultLimitMEMLOCK=infinity" >> "$SYSTEMD_CONF"
     fi
 
-    cat > /etc/sysctl.d/99-3proxy.conf << 'EOF'
+    cat > /etc/sysctl.d/99-3proxy.conf << EOF
 net.core.rmem_max = 268435456
 net.core.wmem_max = 268435456
 net.core.netdev_max_backlog = 10000
@@ -307,7 +342,10 @@ net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_timestamps = 0
+net.ipv4.ip_default_ttl = $TARGET_TTL
+net.ipv6.conf.all.hop_limit = $TARGET_TTL
+net.ipv6.conf.default.hop_limit = $TARGET_TTL
+net.ipv4.tcp_timestamps = $TARGET_TCP_TS
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_fack = 1
 net.ipv4.tcp_window_scaling = 1
@@ -350,9 +388,12 @@ fs.file-max = 4000000
 kernel.pid_max = 1048576
 EOF
 
-    if ! sysctl -p /etc/sysctl.d/99-3proxy.conf >/dev/null 2>&1; then
+        if ! sysctl -p /etc/sysctl.d/99-3proxy.conf >/dev/null 2>&1; then
         warning "Некоторые параметры ядра не применились"
     fi
+    sysctl -w net.ipv4.ip_default_ttl="$TARGET_TTL" >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
 
     systemctl disable --now snapd bluetooth cups avahi-daemon >/dev/null 2>&1 || true
 }
@@ -400,7 +441,7 @@ configure_ipv6() {
         if [ "$PROXY_COUNT" -gt 100 ]; then show_progress "$success" "$PROXY_COUNT"; fi
     done
 
-    [[ $PROXY_COUNT -gt 100 ]]
+    [[ "$PROXY_COUNT" -gt 100 ]] && echo ""
 
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || warning "Не удалось включить IPv6 forwarding"
 
@@ -473,7 +514,18 @@ EOF
 }
 
 configure_firewall() {
-    log "Настройка firewall..."
+    log "Настройка firewall и сетевого стека ($TARGET_OS_NAME)..."
+
+    # Применяем правила mangle для TTL / Hop Limit
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -t mangle -F || true
+        iptables -t mangle -A POSTROUTING -j TTL --ttl-set "$TARGET_TTL" || true
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t mangle -F || true
+        ip6tables -t mangle -A POSTROUTING -j HL --hl-set "$TARGET_TTL" || true
+    fi
 
     if command -v ufw >/dev/null 2>&1; then
         ufw --force reset >/dev/null 2>&1 || true
@@ -544,6 +596,14 @@ if [[ -f "$CONFIG_FILE" && -n "$IFACE" ]]; then
         ip -6 addr add "$ip/64" dev "$IFACE" 2>/dev/null || true
     done
 fi
+EOF
+    cat >> "/home/3proxy/bind_ips.sh" << EOF
+
+# Поддержание сетевого отпечатка Hop Limit при авто-привязке
+sysctl -w net.ipv6.conf.all.hop_limit=$TARGET_TTL >/dev/null 2>&1 || true
+sysctl -w net.ipv4.ip_default_ttl=$TARGET_TTL >/dev/null 2>&1 || true
+ip6tables -t mangle -C POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || ip6tables -t mangle -A POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || true
+iptables -t mangle -C POSTROUTING -j TTL --ttl-set $TARGET_TTL 2>/dev/null || iptables -t mangle -A POSTROUTING -j TTL --ttl-set $TARGET_TTL 2>/dev/null || true
 exit 0
 EOF
     chmod +x /home/3proxy/bind_ips.sh
@@ -582,6 +642,9 @@ EOF
 generate_proxy_list() {
     log "Генерация списка прокси..."
 
+    PROXY_LIST_FILE="/tmp/${EXTERNAL_IPV4}.txt"
+    local proxy_backup_file="/home/3proxy/${EXTERNAL_IPV4}.txt"
+
     > "$PROXY_LIST_FILE"
 
     for ((i=0; i<PROXY_COUNT; i++)); do
@@ -592,35 +655,15 @@ generate_proxy_list() {
         [[ -n "$ipv6_addr" ]] && {
             local auto_port=$((START_PORT + i))
             echo "$user:$pass@$EXTERNAL_IPV4:$auto_port" >> "$PROXY_LIST_FILE"
-            echo "$EXTERNAL_IPV4:$auto_port:$user:$pass" >> "$PROXY_LIST_FILE"
-            echo "" >> "$PROXY_LIST_FILE"
         }
     done
-    local proxy_count=$(wc -l < "$PROXY_LIST_FILE")
-    local upload_success=false
-    local download_url=""
 
-    if timeout 5 curl -s --head https://uploader.sh >/dev/null 2>&1; then
-        local upload_response
-        if upload_response=$(timeout 30 curl -s -F "file=@$PROXY_LIST_FILE" https://uploader.sh/upload 2>/dev/null) && [[ -n "$upload_response" ]]; then
-            download_url=$(echo "$upload_response" | grep -o 'https://uploader.sh/[^"]*' | head -1)
-            [[ -n "$download_url" ]] && upload_success=true
-        fi
-    fi
+    # Сохраняем копию в /home/3proxy и симлинк в /tmp/proxy_list.txt для совместимости
+    cp -f "$PROXY_LIST_FILE" "$proxy_backup_file" 2>/dev/null || true
+    cp -f "$PROXY_LIST_FILE" "/tmp/proxy_list.txt" 2>/dev/null || true
 
-    if [[ "$upload_success" == "false" ]] && timeout 5 curl -s --head https://0x0.st >/dev/null 2>&1; then
-        if download_url=$(timeout 30 curl -s -F "file=@$PROXY_LIST_FILE" https://0x0.st 2>/dev/null) && [[ -n "$download_url" ]]; then
-            upload_success=true
-        fi
-    fi
-
-    if [[ "$upload_success" == "true" ]]; then
-        PROXY_DOWNLOAD_URL="$download_url"
-    else
-        warning "Сервисы загрузки недоступны"
-        info "Список прокси сохранен локально: $PROXY_LIST_FILE"
-        PROXY_DOWNLOAD_URL=""
-    fi
+    local proxy_lines=$(grep -c ":" "$PROXY_LIST_FILE" 2>/dev/null || wc -l < "$PROXY_LIST_FILE")
+    log "✅ Список прокси сохранен на сервере: $PROXY_LIST_FILE (и в $proxy_backup_file)"
 }
 
 start_3proxy() {
@@ -674,6 +717,7 @@ show_statistics() {
     log "🎉 УСТАНОВКА IPv6 PROXY ЗАВЕРШЕНА! (tg: @ExFox)"
     log "=========================================="
     log "📊 Сводка:"
+    log "   • Отпечаток ОС: ${GREEN}$TARGET_OS_NAME${NC} (TTL/HL = $TARGET_TTL)"
     log "   • Всего прокси: $PROXY_COUNT"
     log "   • AUTO: порты $START_PORT-$((START_PORT + PROXY_COUNT - 1))"
     log "   • IPv6 подсеть: $IPV6_SUBNET"
@@ -685,7 +729,7 @@ show_statistics() {
     log "   • Логи: journalctl -u 3proxy -f"
     log "📁 Файлы:"
     log "   • Конфигурация: $CONFIG_FILE"
-    log "   • Список прокси: $PROXY_LIST_FILE"
+    log "   • Список прокси: /tmp/${EXTERNAL_IPV4}.txt (и /home/3proxy/${EXTERNAL_IPV4}.txt)"
     log "=========================================="
 }
 
@@ -719,6 +763,7 @@ main() {
     get_user_input
 
     log "📋 Сводка:"
+    log "   • Отпечаток ОС: ${GREEN}$TARGET_OS_NAME${NC} (TTL/HL = $TARGET_TTL)"
     log "   • IPv6: $IPV6_SUBNET"
     log "   • IPv4: $EXTERNAL_IPV4"
     log "   • Количество прокси: $PROXY_COUNT"
@@ -740,15 +785,22 @@ main() {
     show_statistics
     generate_proxy_list
 
-    END_PORT=$((START_PORT + PROXY_COUNT - 1))
+        END_PORT=$((START_PORT + PROXY_COUNT - 1))
     sudo ufw allow "${START_PORT}:${END_PORT}/tcp" > /dev/null 2>&1
 
-    if [[ -n "${PROXY_DOWNLOAD_URL:-}" ]]; then
-        log "=========================================="
-        log "✅ СПИСОК ПРОКСИ ЗАГРУЖЕН!"
-        log "📥 Скачать: $PROXY_DOWNLOAD_URL"
-        log "=========================================="
-    fi
+    echo ""
+    log "========================================================================"
+    log "📥 КАК СКАЧАТЬ СПИСОК ПРОКСИ НА ВАШ РАБОЧИЙ СТОЛ WINDOWS:"
+    log "========================================================================"
+    echo -e "Откройте ${YELLOW}PowerShell${NC} или ${YELLOW}Терминал Windows${NC} на вашем ПК и выполните:"
+    echo ""
+    echo -e "  ${GREEN}scp root@${EXTERNAL_IPV4}:/tmp/${EXTERNAL_IPV4}.txt C:\\Users\\d4586\\Desktop\\${EXTERNAL_IPV4}.txt${NC}"
+    echo ""
+    echo -e "Или через переменную окружения профиля Windows:"
+    echo -e "  ${BLUE}scp root@${EXTERNAL_IPV4}:/tmp/${EXTERNAL_IPV4}.txt \$env:USERPROFILE\\Desktop\\${EXTERNAL_IPV4}.txt${NC}"
+    echo ""
+    log "📁 Файл на сервере: /tmp/${EXTERNAL_IPV4}.txt (и сохранен в /home/3proxy/${EXTERNAL_IPV4}.txt)"
+    log "========================================================================"
 }
 
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "$@"
