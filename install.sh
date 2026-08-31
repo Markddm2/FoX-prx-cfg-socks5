@@ -372,9 +372,8 @@ net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
-net.ipv6.conf.default.accept_ra = 0
-net.ipv6.conf.all.accept_ra = 0
-net.ipv6.icmp.echo_ignore_all = 1
+net.ipv6.conf.default.accept_ra = 2
+net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.all.proxy_ndp = 1
 net.ipv6.conf.default.proxy_ndp = 1
 net.ipv6.conf.all.forwarding = 1
@@ -394,6 +393,8 @@ EOF
     sysctl -w net.ipv4.ip_default_ttl="$TARGET_TTL" >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.all.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.default.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
 
     systemctl disable --now snapd bluetooth cups avahi-daemon >/dev/null 2>&1 || true
 }
@@ -445,6 +446,17 @@ configure_ipv6() {
 
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || warning "Не удалось включить IPv6 forwarding"
 
+    # Проверяем и восстанавливаем шлюз по умолчанию IPv6
+    if ! ip -6 route show default | grep -q "default"; then
+        local gw=""
+        gw=$(ip -6 neigh show dev "$NETWORK_INTERFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
+        [[ -z "$gw" ]] && gw="${ipv6_base}::1"
+        if [[ -n "$gw" ]]; then
+            ip -6 route replace default via "$gw" dev "$NETWORK_INTERFACE" 2>/dev/null || \
+            ip -6 route replace default via "$gw" dev "$NETWORK_INTERFACE" onlink 2>/dev/null || true
+        fi
+    fi
+
     log "IPv6 настроен: $success из $PROXY_COUNT адресов (неудачно: $failed)"
 
     if [[ $success -eq 0 ]]; then
@@ -484,6 +496,8 @@ maxconn 5000
 stacksize 65536
 nserver 8.8.8.8
 nserver 1.1.1.1
+nserver 2001:4860:4860::8888
+nserver 2606:4700:4700::1111
 nscache 65536
 nscache6 65535
 
@@ -509,7 +523,7 @@ EOF
         local ipv6_addr="${IPV6_ADDRESSES[$i]:-}"
         [[ -z "$ipv6_addr" || -z "$EXTERNAL_IPV4" ]] && continue
         local auto_port=$((START_PORT + i))
-        echo "socks -p$auto_port -n -a -s0 -64 -i$EXTERNAL_IPV4 -e$ipv6_addr" >> "$CONFIG_FILE"
+        echo "socks -p$auto_port -n -a -64 -i$EXTERNAL_IPV4 -e$ipv6_addr" >> "$CONFIG_FILE"
     done
 }
 
@@ -527,22 +541,14 @@ configure_firewall() {
         ip6tables -t mangle -A POSTROUTING -j HL --hl-set "$TARGET_TTL" || true
     fi
 
+    local end_port=$((START_PORT + PROXY_COUNT - 1))
+
     if command -v ufw >/dev/null 2>&1; then
         ufw --force reset >/dev/null 2>&1 || true
         ufw default deny incoming >/dev/null 2>&1 || true
         ufw default allow outgoing >/dev/null 2>&1 || true
         ufw allow ssh >/dev/null 2>&1 || true
-
-        local ports=""
-        for ((i=0; i<PROXY_COUNT; i++)); do
-            ports+="$((START_PORT + i)),"
-        done
-
-        ports="${ports%,}"
-        if [ -n "$ports" ]; then
-            ufw allow $ports/tcp >/dev/null 2>&1 || true
-        fi
-
+        ufw allow "${START_PORT}:${end_port}/tcp" >/dev/null 2>&1 || true
         ufw --force enable >/dev/null 2>&1 || true
 
     elif command -v iptables >/dev/null 2>&1; then
@@ -556,14 +562,7 @@ configure_firewall() {
         iptables -A INPUT -i lo -j ACCEPT || true
         iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true
         iptables -A INPUT -p tcp --dport 22 -j ACCEPT || true
-
-        local ipt_ports=""
-        for ((i=0; i<PROXY_COUNT; i++)); do
-            ipt_ports+="$((START_PORT + i)) "
-        done
-        for port in $ipt_ports; do
-            iptables -A INPUT -p tcp --dport "$port" -j ACCEPT || true
-        done
+        iptables -A INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT || true
 
         mkdir -p /etc/iptables 2>/dev/null || true
         iptables-save > /etc/iptables/rules.v4 || true
@@ -576,7 +575,9 @@ configure_firewall() {
             ip6tables -P OUTPUT ACCEPT || true
             ip6tables -A INPUT -i lo -j ACCEPT || true
             ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT || true
             ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT || true
+            ip6tables -A INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT || true
             ip6tables-save > /etc/iptables/rules.v6 || true
         fi
     fi
@@ -596,10 +597,18 @@ if [[ -f "$CONFIG_FILE" && -n "$IFACE" ]]; then
         ip -6 addr add "$ip/64" dev "$IFACE" 2>/dev/null || true
     done
 fi
+
+# Восстановление шлюза IPv6 если пропал дефолтный маршрут (KVM/GMHOST)
+if ! ip -6 route show default | grep -q "default"; then
+    GW=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
+    [[ -n "$GW" ]] && ip -6 route replace default via "$GW" dev "$IFACE" 2>/dev/null || true
+fi
 EOF
     cat >> "/home/3proxy/bind_ips.sh" << EOF
 
 # Поддержание сетевого отпечатка Hop Limit при авто-привязке
+sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.all.hop_limit=$TARGET_TTL >/dev/null 2>&1 || true
 sysctl -w net.ipv4.ip_default_ttl=$TARGET_TTL >/dev/null 2>&1 || true
 ip6tables -t mangle -C POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || ip6tables -t mangle -A POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || true
@@ -704,8 +713,10 @@ test_proxy_functionality() {
         local test_pass="${test_cred#*:}"
 
         if timeout 10 curl -s --socks5 "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
-           --max-time 5 http://httpbin.org/ip >/dev/null 2>&1; then
-            log "✅ Прокси работает корректно"
+           --max-time 6 https://api64.ipify.org >/dev/null 2>&1 || \
+           timeout 10 curl -s --socks5 "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
+           --max-time 6 https://ipv6.icanhazip.com >/dev/null 2>&1; then
+            log "✅ Прокси работает корректно (IPv6 трафик идёт)"
         else
             warning "⚠️ Прокси может работать некорректно. Проверьте логи: journalctl -u 3proxy -n 20"
         fi
