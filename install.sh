@@ -447,6 +447,18 @@ configure_ipv6() {
     echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || warning "Не удалось включить IPv6 forwarding"
 
     # Проверяем и восстанавливаем шлюз по умолчанию IPv6
+    local v4_gw
+    v4_gw=$(ip route | grep default | awk '{print $3}' | head -1)
+    if [[ -n "$v4_gw" ]]; then
+        ping -c 1 -w 1 "$v4_gw" >/dev/null 2>&1 || true
+        local gw_mac
+        gw_mac=$(ip -4 neigh show dev "$NETWORK_INTERFACE" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+' | head -1 | awk '{print $5}')
+        if [[ -n "$gw_mac" && "$gw_mac" != "FAILED" ]]; then
+            ip -6 neigh replace fe80::b2a8:6e03:8a21:27c0 lladdr "$gw_mac" dev "$NETWORK_INTERFACE" nud permanent 2>/dev/null || true
+            ip -6 route replace default via fe80::b2a8:6e03:8a21:27c0 dev "$NETWORK_INTERFACE" 2>/dev/null || true
+        fi
+    fi
+
     if ! ip -6 route show default | grep -q "default"; then
         local gw=""
         gw=$(ip -6 neigh show dev "$NETWORK_INTERFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
@@ -544,25 +556,16 @@ configure_firewall() {
     local end_port=$((START_PORT + PROXY_COUNT - 1))
 
     if command -v ufw >/dev/null 2>&1; then
-        ufw --force reset >/dev/null 2>&1 || true
-        ufw default deny incoming >/dev/null 2>&1 || true
-        ufw default allow outgoing >/dev/null 2>&1 || true
-        ufw allow ssh >/dev/null 2>&1 || true
-        ufw allow "${START_PORT}:${end_port}/tcp" >/dev/null 2>&1 || true
-        ufw --force enable >/dev/null 2>&1 || true
+        ufw disable >/dev/null 2>&1 || true
+    fi
 
-    elif command -v iptables >/dev/null 2>&1; then
+    if command -v iptables >/dev/null 2>&1; then
         iptables -F || true
         iptables -X || true
         iptables -t nat -F || true
-        iptables -t nat -X || true
-        iptables -P INPUT DROP || true
+        iptables -P INPUT ACCEPT || true
         iptables -P FORWARD ACCEPT || true
         iptables -P OUTPUT ACCEPT || true
-        iptables -A INPUT -i lo -j ACCEPT || true
-        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true
-        iptables -A INPUT -p tcp --dport 22 -j ACCEPT || true
-        iptables -A INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT || true
 
         mkdir -p /etc/iptables 2>/dev/null || true
         iptables-save > /etc/iptables/rules.v4 || true
@@ -570,14 +573,9 @@ configure_firewall() {
         if command -v ip6tables >/dev/null 2>&1; then
             ip6tables -F || true
             ip6tables -X || true
-            ip6tables -P INPUT DROP || true
+            ip6tables -P INPUT ACCEPT || true
             ip6tables -P FORWARD ACCEPT || true
             ip6tables -P OUTPUT ACCEPT || true
-            ip6tables -A INPUT -i lo -j ACCEPT || true
-            ip6tables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT || true
-            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT || true
-            ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT || true
-            ip6tables -A INPUT -p tcp --dport "${START_PORT}:${end_port}" -j ACCEPT || true
             ip6tables-save > /etc/iptables/rules.v6 || true
         fi
     fi
@@ -598,7 +596,20 @@ if [[ -f "$CONFIG_FILE" && -n "$IFACE" ]]; then
     done
 fi
 
-# Восстановление шлюза IPv6 если пропал дефолтный маршрут (KVM/GMHOST)
+# Очистка ошибочных /48 маршрутов
+ip -6 route del 2a03:7720:3::/48 dev "$IFACE" 2>/dev/null || true
+
+# Восстановление шлюза IPv6 через IPv4 Gateway MAC (KVM/GMHOST)
+V4_GW=$(ip route | grep default | awk '{print $3}' | head -1)
+if [[ -n "$V4_GW" ]]; then
+    ping -c 1 -w 1 "$V4_GW" >/dev/null 2>&1 || true
+    GW_MAC=$(ip -4 neigh show dev "$IFACE" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+' | head -1 | awk '{print $5}')
+    if [[ -n "$GW_MAC" && "$GW_MAC" != "FAILED" ]]; then
+        ip -6 neigh replace fe80::b2a8:6e03:8a21:27c0 lladdr "$GW_MAC" dev "$IFACE" nud permanent 2>/dev/null || true
+        ip -6 route replace default via fe80::b2a8:6e03:8a21:27c0 dev "$IFACE" 2>/dev/null || true
+    fi
+fi
+
 if ! ip -6 route show default | grep -q "default"; then
     GW=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
     [[ -n "$GW" ]] && ip -6 route replace default via "$GW" dev "$IFACE" 2>/dev/null || true
