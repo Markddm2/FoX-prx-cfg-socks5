@@ -343,8 +343,6 @@ net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.ip_default_ttl = $TARGET_TTL
-net.ipv6.conf.all.hop_limit = $TARGET_TTL
-net.ipv6.conf.default.hop_limit = $TARGET_TTL
 net.ipv4.tcp_timestamps = $TARGET_TCP_TS
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_fack = 1
@@ -368,6 +366,8 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv6.conf.all.hop_limit = 64
+net.ipv6.conf.default.hop_limit = 64
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_source_route = 0
@@ -376,8 +376,8 @@ net.ipv6.conf.default.accept_ra = 2
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.all.proxy_ndp = 1
 net.ipv6.conf.default.proxy_ndp = 1
-net.ipv6.conf.all.forwarding = 1
-net.ipv6.conf.default.forwarding = 1
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
 net.ipv6.ip_nonlocal_bind = 1
 vm.swappiness = 5
 vm.dirty_ratio = 10
@@ -387,12 +387,14 @@ fs.file-max = 4000000
 kernel.pid_max = 1048576
 EOF
 
-        if ! sysctl -p /etc/sysctl.d/99-3proxy.conf >/dev/null 2>&1; then
+    if ! sysctl -p /etc/sysctl.d/99-3proxy.conf >/dev/null 2>&1; then
         warning "Некоторые параметры ядра не применились"
     fi
     sysctl -w net.ipv4.ip_default_ttl="$TARGET_TTL" >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.all.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
-    sysctl -w net.ipv6.conf.default.hop_limit="$TARGET_TTL" >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.hop_limit=64 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.hop_limit=64 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.forwarding=0 >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
     sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
 
@@ -444,9 +446,17 @@ configure_ipv6() {
 
     [[ "$PROXY_COUNT" -gt 100 ]] && echo ""
 
-    echo 1 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || warning "Не удалось включить IPv6 forwarding"
+    echo 0 > /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || true
+    sysctl -w net.ipv6.conf."$NETWORK_INTERFACE".forwarding=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf."$NETWORK_INTERFACE".hop_limit=64 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf."$NETWORK_INTERFACE".accept_ra=2 >/dev/null 2>&1 || true
 
-    # Проверяем и восстанавливаем шлюз по умолчанию IPv6
+    # Поиск и восстановление шлюза по умолчанию IPv6
+    # 1) Регистрация известных upstream-маршрутизаторов датацентров (Serverius / GMHOST / KVM)
+    ip -6 neigh replace fe80::f21c:2d02:368d:16c0 lladdr f0:1c:2d:8d:16:ca dev "$NETWORK_INTERFACE" nud permanent 2>/dev/null || true
+    ip -6 neigh replace fe80::327c:5e02:3698:3c80 lladdr d4:04:ff:26:37:ca dev "$NETWORK_INTERFACE" nud permanent 2>/dev/null || true
+
+    # 2) Проверяем IPv4 gateway MAC
     local v4_gw
     v4_gw=$(ip route | grep default | awk '{print $3}' | head -1)
     if [[ -n "$v4_gw" ]]; then
@@ -459,9 +469,10 @@ configure_ipv6() {
         fi
     fi
 
+    # 3) Если маршрут по умолчанию все еще не настроен, ищем доступный link-local
     if ! ip -6 route show default | grep -q "default"; then
         local gw=""
-        gw=$(ip -6 neigh show dev "$NETWORK_INTERFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
+        gw=$(ip -6 neigh show dev "$NETWORK_INTERFACE" 2>/dev/null | grep -i "fe80:" | grep -v "FAILED" | head -1 | awk '{print $1}')
         [[ -z "$gw" ]] && gw="${ipv6_base}::1"
         if [[ -n "$gw" ]]; then
             ip -6 route replace default via "$gw" dev "$NETWORK_INTERFACE" 2>/dev/null || \
@@ -543,6 +554,8 @@ configure_firewall() {
     log "Настройка firewall и сетевого стека ($TARGET_OS_NAME)..."
 
     # Применяем правила mangle для TTL / Hop Limit
+    # ВНИМАНИЕ: для IPv6 Hop Limit меняется ТОЛЬКО для TCP и UDP!
+    # Менять Hop Limit для ICMPv6 НЕЛЬЗЯ (RFC 4861 требует Hop Limit = 255 для Neighbor Discovery NDP)
     if command -v iptables >/dev/null 2>&1; then
         iptables -t mangle -F || true
         iptables -t mangle -A POSTROUTING -j TTL --ttl-set "$TARGET_TTL" || true
@@ -550,7 +563,8 @@ configure_firewall() {
 
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t mangle -F || true
-        ip6tables -t mangle -A POSTROUTING -j HL --hl-set "$TARGET_TTL" || true
+        ip6tables -t mangle -A POSTROUTING -p tcp -j HL --hl-set "$TARGET_TTL" || true
+        ip6tables -t mangle -A POSTROUTING -p udp -j HL --hl-set "$TARGET_TTL" || true
     fi
 
     local end_port=$((START_PORT + PROXY_COUNT - 1))
@@ -576,6 +590,8 @@ configure_firewall() {
             ip6tables -P INPUT ACCEPT || true
             ip6tables -P FORWARD ACCEPT || true
             ip6tables -P OUTPUT ACCEPT || true
+            ip6tables -A INPUT -p ipv6-icmp -j ACCEPT || true
+            ip6tables -A OUTPUT -p ipv6-icmp -j ACCEPT || true
             ip6tables-save > /etc/iptables/rules.v6 || true
         fi
     fi
@@ -599,6 +615,10 @@ fi
 # Очистка ошибочных /48 маршрутов
 ip -6 route del 2a03:7720:3::/48 dev "$IFACE" 2>/dev/null || true
 
+# Регистрация физических upstream-маршрутизаторов датацентров (Serverius / GMHOST / KVM)
+ip -6 neigh replace fe80::f21c:2d02:368d:16c0 lladdr f0:1c:2d:8d:16:ca dev "$IFACE" nud permanent 2>/dev/null || true
+ip -6 neigh replace fe80::327c:5e02:3698:3c80 lladdr d4:04:ff:26:37:ca dev "$IFACE" nud permanent 2>/dev/null || true
+
 # Восстановление шлюза IPv6 через IPv4 Gateway MAC (KVM/GMHOST)
 V4_GW=$(ip route | grep default | awk '{print $3}' | head -1)
 if [[ -n "$V4_GW" ]]; then
@@ -611,18 +631,24 @@ if [[ -n "$V4_GW" ]]; then
 fi
 
 if ! ip -6 route show default | grep -q "default"; then
-    GW=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -i "fe80:" | awk '{print $1}' | head -1)
+    GW=$(ip -6 neigh show dev "$IFACE" 2>/dev/null | grep -i "fe80:" | grep -v "FAILED" | head -1 | awk '{print $1}')
     [[ -n "$GW" ]] && ip -6 route replace default via "$GW" dev "$IFACE" 2>/dev/null || true
 fi
 EOF
     cat >> "/home/3proxy/bind_ips.sh" << EOF
 
 # Поддержание сетевого отпечатка Hop Limit при авто-привязке
+# Защита ICMPv6 NDP: Hop Limit для служебных пакетов ядра остается 64/255, а mangle меняет только TCP/UDP
 sysctl -w net.ipv6.conf.all.accept_ra=2 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.default.accept_ra=2 >/dev/null 2>&1 || true
-sysctl -w net.ipv6.conf.all.hop_limit=$TARGET_TTL >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.hop_limit=64 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.hop_limit=64 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.default.forwarding=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.ip_default_ttl=$TARGET_TTL >/dev/null 2>&1 || true
-ip6tables -t mangle -C POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || ip6tables -t mangle -A POSTROUTING -s "$IPV6_SUBNET" -j HL --hl-set $TARGET_TTL 2>/dev/null || true
+
+ip6tables -t mangle -C POSTROUTING -p tcp -j HL --hl-set $TARGET_TTL 2>/dev/null || ip6tables -t mangle -A POSTROUTING -p tcp -j HL --hl-set $TARGET_TTL 2>/dev/null || true
+ip6tables -t mangle -C POSTROUTING -p udp -j HL --hl-set $TARGET_TTL 2>/dev/null || ip6tables -t mangle -A POSTROUTING -p udp -j HL --hl-set $TARGET_TTL 2>/dev/null || true
 iptables -t mangle -C POSTROUTING -j TTL --ttl-set $TARGET_TTL 2>/dev/null || iptables -t mangle -A POSTROUTING -j TTL --ttl-set $TARGET_TTL 2>/dev/null || true
 exit 0
 EOF
@@ -723,10 +749,12 @@ test_proxy_functionality() {
         local test_user="${test_cred%:*}"
         local test_pass="${test_cred#*:}"
 
-        if timeout 10 curl -s --socks5 "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
+        if timeout 10 curl -s --socks5-hostname "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
            --max-time 6 https://api64.ipify.org >/dev/null 2>&1 || \
+           timeout 10 curl -s --socks5-hostname "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
+           --max-time 6 https://ipv6.icanhazip.com >/dev/null 2>&1 || \
            timeout 10 curl -s --socks5 "$test_user:$test_pass@$EXTERNAL_IPV4:$test_port" \
-           --max-time 6 https://ipv6.icanhazip.com >/dev/null 2>&1; then
+           --max-time 6 https://api64.ipify.org >/dev/null 2>&1; then
             log "✅ Прокси работает корректно (IPv6 трафик идёт)"
         else
             warning "⚠️ Прокси может работать некорректно. Проверьте логи: journalctl -u 3proxy -n 20"
